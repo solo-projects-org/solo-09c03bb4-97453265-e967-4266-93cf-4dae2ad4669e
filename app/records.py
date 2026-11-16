@@ -15,7 +15,7 @@ import io
 import json
 import sqlite3
 
-from . import state
+from . import corrections, state
 from .db import conn, meta_value, write_lock
 from .normalize import normalize_text
 
@@ -59,7 +59,6 @@ def import_records_csv(content: bytes, filename: str | None) -> dict:
     planned: list[dict] = []
     seen_dois: set[str] = set()
     accepted = reused = 0
-    reasons: list[str] = []
 
     # 阶段一：逐行判定（不写库）。
     for idx, row in enumerate(rows, start=1):
@@ -123,6 +122,7 @@ def import_records_csv(content: bytes, filename: str | None) -> dict:
     # 阶段二：单事务提交（重建期间照常写入【当前】FTS，立即可检索）。
     active_fts = state.active_fts_name()
     active_dict = int(meta_value(c, "active_dict"))
+    reprocessed: list[dict] = []
     with write_lock:
         c.execute("BEGIN IMMEDIATE")
         try:
@@ -146,6 +146,7 @@ def import_records_csv(content: bytes, filename: str | None) -> dict:
                      item["abstract"], item["hash"], active_dict),
                 )
                 rid = cur.lastrowid
+                item["new_id"] = rid
                 # 先删后插：FTS 中已存在的 rowid 直接 INSERT 会被当作更新，
                 # 显式 DELETE 保证语义确定（正常路径下该 rowid 不存在）。
                 c.execute(
@@ -156,12 +157,17 @@ def import_records_csv(content: bytes, filename: str | None) -> dict:
                     (rid, normalize_text(item["title"], mapping),
                      normalize_text(item["abstract"], mapping)),
                 )
+                # 人工校订三方重合并：与批次接纳、供数资格在同一事务内生效；
+                # 无在校人工版的 DOI 直接跳过（供数沿用最新 OCR）。
+                outcome = corrections.reprocess_after_import(c, item["doi"], rid)
+                if outcome is not None:
+                    reprocessed.append(outcome)
             batch_id = c.execute(
                 "INSERT INTO import_batches(filename, status, total, "
                 "accepted, reused, detail) VALUES(?,?,?,?,?,?)",
                 (filename, "accepted" if accepted else "reused",
                  len(rows), accepted, reused,
-                 json.dumps(reasons or [p["action"] for p in planned],
+                 json.dumps(reprocessed or [p["action"] for p in planned],
                             ensure_ascii=False)),
             ).lastrowid
             c.execute("COMMIT")
@@ -171,4 +177,5 @@ def import_records_csv(content: bytes, filename: str | None) -> dict:
 
     return {"batch_id": batch_id, "total": len(rows),
             "accepted": accepted, "reused": reused,
-            "status": "accepted" if accepted else "reused"}
+            "status": "accepted" if accepted else "reused",
+            "correction_reprocessing": reprocessed}

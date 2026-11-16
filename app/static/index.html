@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OCR 题录纠错检索系统</title>
 <style>
-  :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; --blue:#0969da; }
+  :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; --blue:#0969da; --purple:#8250df; }
   * { box-sizing: border-box; }
   body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
          margin:0; color:#1f2328; background:var(--bg); }
@@ -18,9 +18,12 @@
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   input[type=search], input[type=text] { padding:8px 10px; border:1px solid var(--bd);
          border-radius:6px; font-size:14px; min-width:260px; flex:1; }
+  textarea { width:100%; min-height:70px; padding:8px 10px; border:1px solid var(--bd);
+         border-radius:6px; font-size:13px; font-family:inherit; resize:vertical; }
   button { padding:8px 16px; border:1px solid var(--bd); border-radius:6px;
            background:#f6f8fa; cursor:pointer; font-size:14px; }
   button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
+  button.small { padding:3px 10px; font-size:12px; }
   button:disabled { opacity:.5; cursor:not-allowed; }
   table { border-collapse:collapse; width:100%; font-size:13px; }
   th, td { border:1px solid var(--bd); padding:6px 8px; text-align:left; vertical-align:top; }
@@ -31,6 +34,9 @@
   .pill.failed, .pill.rejected, .pill.abandoned { background:#ffebe9; color:var(--err); }
   .pill.superseded { background:#eaeef2; color:#57606a; }
   .pill.accepted, .pill.reused, .pill.done { background:#dafbe1; color:var(--ok); }
+  .pill.clean { background:#dafbe1; color:var(--ok); }
+  .pill.conflict { background:#fff1e5; color:#bc4c00; }
+  .pill.uncorrected { background:#eaeef2; color:#57606a; }
   .msg { margin-top:10px; padding:10px 12px; border-radius:6px; font-size:13px; white-space:pre-wrap; }
   .msg.ok { background:#dafbe1; border:1px solid #aceebb; }
   .msg.err { background:#ffebe9; border:1px solid #ffabaf; }
@@ -40,16 +46,36 @@
   code { background:var(--bg); padding:1px 5px; border-radius:4px; }
   .hint { font-size:12px; color:#656d76; margin-top:6px; line-height:1.6; }
   .abstract { color:#57606a; max-width:420px; }
+  dialog { border:1px solid var(--bd); border-radius:10px; padding:0; width:min(860px, 94vw); }
+  dialog::backdrop { background:rgba(0,0,0,.35); }
+  .dlg-head { display:flex; justify-content:space-between; align-items:center;
+         padding:12px 16px; border-bottom:1px solid var(--bd); background:var(--bg); }
+  .dlg-head b { font-size:14px; word-break:break-all; }
+  .dlg-body { padding:16px; max-height:70vh; overflow:auto; }
+  .dlg-foot { padding:12px 16px; border-top:1px solid var(--bd); display:flex;
+         justify-content:flex-end; gap:10px; background:var(--bg); }
+  .threeway { border:1px solid var(--bd); border-radius:8px; margin-bottom:12px; overflow:hidden; }
+  .threeway .opt { display:grid; grid-template-columns:28px 1fr; gap:8px; padding:8px 10px;
+         border-top:1px solid var(--bd); align-items:start; }
+  .threeway .opt:first-child { border-top:none; }
+  .threeway .opt.selected { background:#ddf4ff; }
+  .opt .tag { font-size:11px; color:#fff; background:var(--purple); border-radius:4px;
+         padding:1px 6px; justify-self:start; margin-top:2px; }
+  .opt .tag.ocr { background:var(--blue); } .opt .tag.base { background:#57606a; }
+  .opt .tag.human { background:var(--ok); }
+  .opt pre { margin:2px 0 0; white-space:pre-wrap; word-break:break-word;
+         font-family:inherit; font-size:13px; }
+  label.fld { display:block; font-size:13px; font-weight:600; margin:10px 0 4px; }
 </style>
 </head>
 <body>
 <header>
   <h1>OCR 题录纠错检索系统</h1>
-  <p>FastAPI · SQLite FTS5 · 替换词典原子换版 · 重建期间旧索引持续服务</p>
+  <p>FastAPI · SQLite FTS5 · 替换词典原子换版 · 人工校订三方合并 · 重建期间旧索引持续服务</p>
 </header>
 <main>
   <section class="card">
-    <h2>① 检索（查询词与题录使用同一活动词典归一，全部命中才返回）</h2>
+    <h2>① 检索（查询词与题录使用同一活动词典归一，全部命中才返回；返回原始题录，改写只在索引侧）</h2>
     <div class="row">
       <input id="q" type="search" placeholder="例如：teh quantum machne（可故意写错词）">
       <button class="primary" onclick="doSearch()">检索</button>
@@ -64,20 +90,54 @@
     </div>
   </section>
 
+  <section class="card">
+    <h2>② 人工校订（以保存时所见 OCR 为基底；新 OCR 修订逐字段三方合并，冲突整条暂停供数）</h2>
+    <div class="row">
+      <button class="primary" onclick="loadCorrections()">刷新校订列表</button>
+      <select id="corrFilter" onchange="loadCorrections()" style="padding:7px;border-radius:6px;border:1px solid var(--bd)">
+        <option value="">全部状态</option>
+        <option value="uncorrected">未校订（沿用 OCR）</option>
+        <option value="clean">已校订·可供数</option>
+        <option value="conflict">冲突·暂停供数</option>
+      </select>
+      <span id="corrCounts" class="hint"></span>
+    </div>
+    <div id="corrMsg"></div>
+    <div style="margin-top:10px; overflow-x:auto">
+      <table id="corrTable"><thead>
+        <tr><th>DOI</th><th>校订状态</th><th>现行 OCR 题名</th><th>合并题名</th><th>题名来源</th><th>操作</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>③ 供数 CSV 下载（只含可供数题录，同一已提交状态快照；未校订沿用最新 OCR）</h2>
+    <div class="row">
+      <a href="/api/export/supply.csv" target="_blank">
+        <button class="primary" type="button">下载 supply_records.csv</button>
+      </a>
+      <span class="hint">列：<code>doi, revision, title, abstract, title_source,
+        abstract_source, ocr_base_record_id, ocr_live_record_id,
+        human_correction_id</code>；source ∈ base/ocr/human/manual；
+        冲突题录整条排除。</span>
+    </div>
+  </section>
+
   <div class="grid2">
     <section class="card">
-      <h2>② 上传题录 CSV</h2>
+      <h2>④ 上传题录 CSV（OCR 导入仍沿用原修订规则，整批事务）</h2>
       <div class="row">
         <input id="csvFile" type="file" accept=".csv,text/csv">
         <button class="primary" onclick="uploadCsv()">上传导入</button>
       </div>
       <div class="hint">必需列：<code>doi,revision,title</code>，可选 <code>abstract</code>。
-        高修订更正旧文；同版同文复用；同版异文或旧版整批拒收。</div>
+        高修订更正旧文；同版同文复用；同版异文或旧版整批拒收。
+        已有人工校订的 DOI 会在同一事务内自动重新合并，供数资格随批次一起生效。</div>
       <div id="csvMsg"></div>
     </section>
 
     <section class="card">
-      <h2>③ 上传替换词典 CSV</h2>
+      <h2>⑤ 上传替换词典 CSV</h2>
       <div class="row">
         <input id="dictFile" type="file" accept=".csv,text/csv">
         <button class="primary" onclick="uploadDict()">上传并重建</button>
@@ -89,7 +149,7 @@
   </div>
 
   <section class="card">
-    <h2>④ 系统状态</h2>
+    <h2>⑥ 系统状态</h2>
     <div id="statusBox" class="hint">加载中…</div>
     <div style="margin-top:10px; overflow-x:auto">
       <table id="dictTable"><thead>
@@ -101,8 +161,46 @@
         <tr><th>批次</th><th>文件</th><th>状态</th><th>总行</th><th>采纳</th><th>复用</th><th>时间</th></tr>
       </thead><tbody></tbody></table>
     </div>
+    <div style="margin-top:12px; overflow-x:auto">
+      <table id="corrBatchTable"><thead>
+        <tr><th>校订批次</th><th>类型</th><th>状态</th><th>数量</th><th>时间</th><th>说明</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
   </section>
 </main>
+
+<!-- 人工校订编辑框 -->
+<dialog id="editDlg">
+  <div class="dlg-head"><b id="editTitle"></b><button class="small" onclick="document.getElementById('editDlg').close()">关闭</button></div>
+  <div class="dlg-body">
+    <div class="hint" id="editBaseInfo"></div>
+    <label class="fld">校订题名 *</label>
+    <textarea id="editTitleV"></textarea>
+    <label class="fld">校订摘要（可留空）</label>
+    <textarea id="editAbstractV"></textarea>
+    <div class="hint">保存即生成新的人工版，并以当前现行 OCR 为新的合并基底；
+      能自动合并的修订立即更新供数，字段分歧将整条暂停。</div>
+  </div>
+  <div class="dlg-foot">
+    <button onclick="document.getElementById('editDlg').close()">取消</button>
+    <button class="primary" onclick="submitEdit()">保存校订</button>
+  </div>
+</dialog>
+
+<!-- 冲突裁决框：仅展示三方既有内容，裁决绑定页面所见版本 -->
+<dialog id="resolveDlg">
+  <div class="dlg-head"><b id="resolveTitle"></b><button class="small" onclick="document.getElementById('resolveDlg').close()">关闭</button></div>
+  <div class="dlg-body">
+    <div class="hint" id="resolveBind"></div>
+    <div id="resolveBody"></div>
+    <div class="hint">裁决只接受三方内容（base/ocr/human）。若保存后 OCR 或人工版又发生变化，
+      提交将被拒绝（409），需刷新后重新处理——旧页面不能恢复供数。</div>
+  </div>
+  <div class="dlg-foot">
+    <button onclick="document.getElementById('resolveDlg').close()">取消</button>
+    <button class="primary" onclick="submitResolve()">提交裁决</button>
+  </div>
+</dialog>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -110,6 +208,7 @@ function show(el, cls, text){ el.innerHTML = `<div class="msg ${cls}">${escapeHt
 function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function pill(s){ return `<span class="pill ${s}">${s}</span>`; }
+const SRC_CN = {base:'基底OCR', ocr:'现行OCR', human:'人工版', manual:'人工裁决', '':'—'};
 
 async function uploadCsv(){
   const f = $('csvFile').files[0];
@@ -119,9 +218,12 @@ async function uploadCsv(){
     const r = await fetch('/api/records/import',{method:'POST',body:fd});
     const d = await r.json();
     if(!r.ok) throw new Error(d.detail || r.status);
+    const rp = d.correction_reprocessing || [];
+    const cf = rp.filter(x => x.status === 'conflict').length;
     show($('csvMsg'),'ok',
-      `批次 #${d.batch_id} ${d.status}：共 ${d.total} 行，采纳 ${d.accepted}，复用 ${d.reused}`);
-    refreshStatus();
+      `批次 #${d.batch_id} ${d.status}：共 ${d.total} 行，采纳 ${d.accepted}，复用 ${d.reused}` +
+      (rp.length ? `\n触发 ${rp.length} 条人工校订重新合并，其中 ${cf} 条冲突暂停供数` : ''));
+    refreshStatus(); loadCorrections();
   }catch(e){ show($('csvMsg'),'err','整批拒收：'+e.message); refreshStatus(); }
 }
 
@@ -169,12 +271,167 @@ async function doSearch(){
   }
 }
 
+// ---------------- 人工校订 ----------------
+let stateByDoi = {};
+
+async function loadCorrections(){
+  const filter = $('corrFilter').value;
+  const [recsR, corrR] = await Promise.all([
+    fetch('/api/records?limit=500'), fetch('/api/corrections?limit=500')
+  ]);
+  const recs = (await recsR.json()).results;
+  const corr = (await corrR.json()).results;
+  stateByDoi = Object.fromEntries(corr.map(x => [x.doi, x]));
+  const tb = $('#corrTable tbody'); tb.innerHTML = '';
+  let shown = 0;
+  for(const r of recs){
+    const s = stateByDoi[r.doi];
+    const st = s ? s.status : 'uncorrected';
+    if(filter && st !== filter) continue;
+    shown++;
+    const merged = s ? (s.merged_title || '（冲突暂停，未合并）') : '';
+    const src = s ? SRC_CN[s.title_source] : '—';
+    const btn = st === 'conflict'
+      ? `<button class="small" style="background:#fff1e5" onclick="openResolve('${encodeURIComponent(r.doi)}')">裁决冲突</button>`
+      : `<button class="small" onclick="openEdit('${encodeURIComponent(r.doi)}')">${s ? '重新校订' : '人工校订'}</button>`;
+    tb.insertAdjacentHTML('beforeend',
+      `<tr><td>${escapeHtml(r.doi)}</td><td>${pill(st)}</td>`+
+      `<td class="abstract">${escapeHtml(r.title)}</td>`+
+      `<td class="abstract">${escapeHtml(merged)}</td><td>${src}</td><td>${btn}</td></tr>`);
+  }
+  if(!shown) tb.innerHTML = '<tr><td colspan="6" class="muted">无匹配题录</td></tr>';
+  const st = (await (await fetch('/api/status')).json()).correction_counts;
+  $('corrCounts').innerHTML =
+    `现行题录 <b>${st.live_records}</b> · 未校订 ${st.uncorrected} · ` +
+    `可供数(已校订) ${st.corrected_clean} · 冲突暂停 ${st.conflict_suspended} · ` +
+    `供数资格合计 <b>${st.supply_eligible}</b>`;
+}
+
+async function openEdit(encDoi){
+  const doi = decodeURIComponent(encDoi);
+  const s = stateByDoi[doi];
+  // 编辑框预填：已有人工版取人工版，否则取当前 OCR 原文（补查摘要）。
+  let title, abstract, baseInfo;
+  if(s){
+    title = s.human.title; abstract = s.human.abstract;
+    baseInfo = `基底 OCR 行 #${s.base_ocr.id}（修订 ${s.base_ocr.revision}）；保存后将以当前现行 OCR 行 #${s.live_ocr.id} 重新合并`;
+  }else{
+    const recs = (await (await fetch('/api/records?limit=500')).json()).results;
+    const live = recs.find(x => x.doi === doi);
+    title = live ? live.title : '';
+    abstract = live ? live.abstract : '';
+    baseInfo = '尚无人工版：保存后以当前现行 OCR 为基底';
+  }
+  $('editTitle').textContent = '人工校订 · ' + doi;
+  $('editBaseInfo').textContent = baseInfo;
+  $('editTitleV').value = title;
+  $('editAbstractV').value = abstract;
+  $('editDlg').dataset.doi = doi;
+  $('editDlg').showModal();
+}
+
+async function submitEdit(){
+  const doi = $('editDlg').dataset.doi;
+  const payload = {items: [{
+    doi, title: $('editTitleV').value.trim(),
+    abstract: $('editAbstractV').value.trim(),
+  }]};
+  if(!payload.items[0].title){ show($('corrMsg'),'err','题名不能为空'); return; }
+  try{
+    const r = await fetch('/api/corrections',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || r.status);
+    $('editDlg').close();
+    const cf = d.results.find(x => x.status === 'conflict');
+    show($('corrMsg'), cf ? 'err' : 'ok',
+      `校订批次 #${d.batch_id} 已提交：自动合并 ${d.auto_merged} 条，冲突暂停 ${d.conflicts} 条` +
+      (cf ? `（${cf.doi} 字段：${cf.conflict_fields.join('、')}）` : ''));
+    await loadCorrections(); refreshStatus();
+  }catch(e){ show($('corrMsg'),'err','提交失败（整批未生效）：'+e.message); }
+}
+
+async function openResolve(encDoi){
+  const doi = decodeURIComponent(encDoi);
+  const r = await fetch('/api/corrections/' + encodeURIComponent(doi));
+  const s = await r.json();
+  if(!r.ok){ show($('corrMsg'),'err', s.detail || r.status); return; }
+  if(s.status !== 'conflict'){ show($('corrMsg'),'ok','该 DOI 当前无冲突'); return; }
+  $('resolveDlg').dataset.doi = doi;
+  $('resolveDlg').dataset.ocr = s.live_ocr.id;
+  $('resolveDlg').dataset.human = s.human.id;
+  $('resolveTitle').textContent = '冲突裁决 · ' + doi;
+  $('resolveBind').innerHTML =
+    `版本绑定：现行 OCR 行 <b>#${s.live_ocr.id}</b>（修订 ${s.live_ocr.revision}）· ` +
+    `人工版 <b>#${s.human.id}</b> · 基底 OCR 行 #${s.base_ocr.id}`;
+  const body = $('resolveBody'); body.innerHTML = '';
+  for(const f of ['title','abstract']){
+    const label = f === 'title' ? '题名' : '摘要';
+    const cd = s.conflict_detail[f];
+    if(!cd){
+      body.insertAdjacentHTML('beforeend',
+        `<label class="fld">${label}（自动合并：${escapeHtml(SRC_CN[s[f+'_source']])}）</label>
+         <pre style="margin:0;font-family:inherit;font-size:13px;white-space:pre-wrap">${escapeHtml(s['merged_'+f])}</pre>`);
+      continue;
+    }
+    const opts = [
+      ['base', '基底OCR', cd.base], ['ocr', '现行OCR', cd.ocr], ['human', '人工版', cd.human],
+    ];
+    body.insertAdjacentHTML('beforeend', `<label class="fld">${label}（三方分歧，请选择一个版本）</label>`);
+    const box = document.createElement('div');
+    box.className = 'threeway'; box.dataset.field = f;
+    opts.forEach(([key, cn, val], i) => {
+      const div = document.createElement('div');
+      div.className = 'opt' + (i === 0 ? ' selected' : '');
+      div.innerHTML =
+        `<input type="radio" name="${f}" value="${key}" ${i===0?'checked':''}>` +
+        `<div><span class="tag ${key}">${cn}</span><pre>${escapeHtml(val || '（空）')}</pre></div>`;
+      div.querySelector('input').addEventListener('change', () => {
+        box.querySelectorAll('.opt').forEach(o => o.classList.remove('selected'));
+        div.classList.add('selected');
+      });
+      box.appendChild(div);
+    });
+    body.appendChild(box);
+  }
+  $('resolveDlg').showModal();
+}
+
+async function submitResolve(){
+  const dlg = $('resolveDlg');
+  const doi = dlg.dataset.doi;
+  const resolutions = {};
+  dlg.querySelectorAll('.threeway').forEach(box => {
+    const picked = box.querySelector('input:checked');
+    if(picked) resolutions[box.dataset.field] = {source: picked.value};
+  });
+  try{
+    const r = await fetch('/api/corrections/' + encodeURIComponent(doi) + '/resolve', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        resolutions,
+        expected_ocr_record_id: Number(dlg.dataset.ocr),
+        expected_human_correction_id: Number(dlg.dataset.human),
+      })});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || r.status);
+    dlg.close();
+    show($('corrMsg'),'ok',
+      `裁决批次 #${d.batch_id} 已提交（字段：${d.resolved_fields.join('、')}），DOI 恢复供数`);
+    await loadCorrections(); refreshStatus();
+  }catch(e){ show($('corrMsg'),'err', e.message); dlg.close(); }
+}
+
 async function refreshStatus(){
   const r = await fetch('/api/status'); const d = await r.json();
   $('statusBox').innerHTML =
     `活动词典版本：<b>#${d.active_dict_version_id}</b>（0=无词典，恒等映射） · `+
     `活动 FTS：<b>${d.active_fts}</b> · 现行题录：<b>${d.record_count}</b> · `+
-    `已取代：${d.superseded_count} · 重建中：${d.rebuild_in_progress ? '是' : '否'}`+
+    `已取代：${d.superseded_count} · 重建中：${d.rebuild_in_progress ? '是' : '否'}<br>`+
+    `校订统计：未校订 ${d.correction_counts.uncorrected} · 已校订可供数 `+
+    `${d.correction_counts.corrected_clean} · 冲突暂停 ${d.correction_counts.conflict_suspended} · `+
+    `供数资格合计 <b>${d.correction_counts.supply_eligible}</b>`+
     (d.startup_recovery && (d.startup_recovery.abandoned_jobs.length ||
       d.startup_recovery.orphan_fts.length || d.startup_recovery.active_rebuilt)
       ? `<br>上次启动恢复：${escapeHtml(JSON.stringify(d.startup_recovery))}` : '');
@@ -194,6 +451,13 @@ async function refreshStatus(){
       `<td>${pill(b.status)}</td><td>${b.total}</td><td>${b.accepted}</td>`+
       `<td>${b.reused}</td><td>${b.received_at}</td></tr>`);
   }
+  const cbt = $('#corrBatchTable tbody'); cbt.innerHTML='';
+  for(const b of d.correction_batches){
+    cbt.insertAdjacentHTML('beforeend',
+      `<tr><td>#${b.id}</td><td>${b.kind}</td><td>${pill(b.status)}</td>`+
+      `<td>${b.total}</td><td>${b.created_at}</td>`+
+      `<td class="abstract">${escapeHtml((b.detail||'').slice(0,180))}</td></tr>`);
+  }
 }
 
 function pollStatus(){
@@ -206,6 +470,7 @@ function pollStatus(){
 }
 $('q').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
 refreshStatus();
+loadCorrections();
 </script>
 </body>
 </html>

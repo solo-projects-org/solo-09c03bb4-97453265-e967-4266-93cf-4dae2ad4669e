@@ -1,4 +1,6 @@
-"""真实 uvicorn 子进程端到端冒烟：含崩溃重启恢复（非 TestClient）。"""
+"""真实 uvicorn 子进程端到端冒烟：含崩溃重启恢复与人工校订（非 TestClient）。"""
+import csv
+import io
 import json
 import os
 import signal
@@ -174,8 +176,144 @@ try:
         if re.match(r"^fts_v\d+$", r[0])]
     check("旧 FTS 已删除、无孤儿", masters == ["fts_v3"], str(masters))
     con.close()
+
+    # --- 人工校订：提交、OCR 自动合并、冲突暂停、裁决恢复、供数 CSV ---
+    def jpost(path, payload):
+        body = json.dumps(payload).encode()
+        return http("POST", path, body, "application/json")
+
+    body, ctype = multipart("file", "corr.csv",
+                            b"doi,revision,title,abstract\n"
+                            b"10.9/a,1,base title A,base abstract A\n"
+                            b"10.9/b,1,base title B,base abstract B\n"
+                            b"10.9/c,1,ocr only title,ocr only abs\n")
+    code, d = http("POST", "/api/records/import", body, ctype)
+    check("校订用题录导入", code == 201, str(d))
+
+    code, d = jpost("/api/corrections", {"items": [
+        {"doi": "10.9/a", "title": "base title A",
+         "abstract": "human abstract A"},
+        {"doi": "10.9/b", "title": "human title B",
+         "abstract": "human abstract B"},
+    ]})
+    check("人工校订整批提交", code == 201 and d["auto_merged"] == 2, str(d))
+
+    # 新 OCR 修订：a 题名仅 OCR 改、摘要仅人工改 -> 两字段都自动合并；
+    # b 两字段都分歧 -> 冲突整条暂停。
+    body, ctype = multipart("file", "rev2.csv",
+                            b"doi,revision,title,abstract\n"
+                            b"10.9/a,2,new ocr title A,base abstract A\n"
+                            b"10.9/b,2,new ocr title B,new ocr abstract B\n"
+                            b"10.9/c,2,ocr only title v2,ocr only abs v2\n")
+    code, d = http("POST", "/api/records/import", body, ctype)
+    check("带重合并的 OCR 批次接纳", code == 201, str(d))
+    rep = {x["doi"]: x for x in d["correction_reprocessing"]}
+    check("a 自动合并 / b 冲突",
+          rep["10.9/a"]["status"] == "clean"
+          and rep["10.9/b"]["status"] == "conflict"
+          and rep["10.9/b"]["conflict_fields"] == ["title", "abstract"],
+          str(rep))
+
+    code, st = http("GET", "/api/corrections/10.9/b")
+    check("冲突三方内容保留", code == 200 and st["status"] == "conflict"
+          and st["conflict_detail"]["title"] == {
+              "base": "base title B", "ocr": "new ocr title B",
+              "human": "human title B"}, str(st.get("conflict_detail")))
+
+    # 旧版本绑定的裁决页面 -> 409 路径先构造“新鲜”绑定再验证过期场景
+    code, fresh = http("GET", "/api/corrections/10.9/b")
+    code, d = jpost("/api/corrections/10.9/b/resolve", {
+        "resolutions": {"title": {"source": "human"},
+                        "abstract": {"source": "ocr"}},
+        "expected_ocr_record_id": fresh["live_ocr"]["id"] - 999,
+        "expected_human_correction_id": fresh["human"]["id"],
+    })
+    check("过期页面裁决被拒(409)", code == 409, str(d))
+
+    code, d = jpost("/api/corrections/10.9/b/resolve", {
+        "resolutions": {"title": {"source": "human"},
+                        "abstract": {"source": "ocr"}},
+        "expected_ocr_record_id": fresh["live_ocr"]["id"],
+        "expected_human_correction_id": fresh["human"]["id"],
+    })
+    check("新鲜页面裁决成功恢复供数", code == 200, str(d))
+
+    with urllib.request.urlopen(f"{BASE}/api/export/supply.csv",
+                                timeout=10) as r:
+        check("供数 CSV 可下载", r.status == 200
+              and r.headers["Content-Type"].startswith("text/csv"))
+        csv_text = r.read().decode()
+    supply = {row["doi"]: row for row in csv.DictReader(io.StringIO(csv_text))}
+    check("供数 CSV 含全部现行题录（冲突已裁决）",
+          {f"10.9/{x}" for x in "abc"} <= set(supply), str(supply.keys()))
+    check("a 题名取 OCR 侧自动合并值",
+          supply["10.9/a"]["title"] == "new ocr title A"
+          and supply["10.9/a"]["title_source"] == "ocr",
+          supply["10.9/a"])
+    check("b 题名取人工裁决值、摘要取 OCR 裁决值",
+          supply["10.9/b"]["title"] == "human title B"
+          and supply["10.9/b"]["abstract"] == "new ocr abstract B"
+          and supply["10.9/b"]["title_source"] == "manual",
+          supply["10.9/b"])
+    check("未校订 c 沿用最新 OCR",
+          supply["10.9/c"]["title"] == "ocr only title v2"
+          and supply["10.9/c"]["human_correction_id"] == "",
+          supply["10.9/c"])
+
+    # 再制造一个未裁决冲突，验证重启后冲突持久、供数仍排除
+    code, d = jpost("/api/corrections", {"items": [
+        {"doi": "10.9/c", "title": "human title C",
+         "abstract": "ocr only abs v2"}]})
+    check("c 人工校订提交", code == 201, str(d))
+    body, ctype = multipart("file", "rev3.csv",
+                            b"doi,revision,title,abstract\n"
+                            b"10.9/c,3,divergent ocr C,ocr only abs v2\n")
+    code, d = http("POST", "/api/records/import", body, ctype)
+    check("c 冲突批次接纳", code == 201
+          and d["correction_reprocessing"][0]["status"] == "conflict", str(d))
+    before_csv = csv_text
 finally:
     p2.send_signal(signal.SIGTERM)
     p2.wait(timeout=10)
 
-print("\n全部端到端冒烟检查通过")
+# --- 进程 3：重启后校订/冲突/供数资格持久化 ---
+p3 = server("/tmp/smoke_e2e/c.log")
+wait_health(p3)
+try:
+    code, st = http("GET", "/api/corrections/10.9/c")
+    check("重启后冲突保留", code == 200 and st["status"] == "conflict"
+          and st["conflict_detail"]["title"]["human"] == "human title C",
+          str(st.get("conflict_detail")))
+    code, st = http("GET", "/api/corrections/10.9/b")
+    check("重启后已裁决状态保留", code == 200 and st["status"] == "clean"
+          and st["merged_title"] == "human title B", str(st))
+    with urllib.request.urlopen(f"{BASE}/api/export/supply.csv",
+                                timeout=10) as r:
+        after_csv = r.read().decode()
+    supply3 = {row["doi"]: row for row in csv.DictReader(
+        io.StringIO(after_csv))}
+    check("重启后冲突题录仍不供数", "10.9/c" not in supply3, str(supply3.keys()))
+    check("重启后其余供数内容不变",
+          {k: (v["title"], v["abstract"]) for k, v in supply3.items()}
+          == {k: (v["title"], v["abstract"])
+              for k, v in {row["doi"]: row for row in
+                           csv.DictReader(io.StringIO(before_csv))}.items()
+              if k != "10.9/c"})
+    # 重启后仍可裁决并恢复供数
+    code, fresh = http("GET", "/api/corrections/10.9/c")
+    code, d = jpost("/api/corrections/10.9/c/resolve", {
+        "resolutions": {"title": {"source": "human"}},
+        "expected_ocr_record_id": fresh["live_ocr"]["id"],
+        "expected_human_correction_id": fresh["human"]["id"],
+    })
+    check("重启后裁决成功", code == 200, str(d))
+    with urllib.request.urlopen(f"{BASE}/api/export/supply.csv",
+                                timeout=10) as r:
+        final_csv = r.read().decode()
+    check("裁决后恢复供数", "10.9/c" in
+          {row["doi"] for row in csv.DictReader(io.StringIO(final_csv))})
+finally:
+    p3.send_signal(signal.SIGTERM)
+    p3.wait(timeout=10)
+
+print("\n全部端到端冒烟检查通过（含人工校订三方合并与重启持久化）")

@@ -89,6 +89,57 @@ SCHEMA = [
         finished_at     TEXT
     )
     """,
+    # 人工校订版本（append-only，新版保存后旧版置 superseded）。
+    # base_record_id 指向保存时所见的 OCR 现行行（records.id），即三方合并的基底 B；
+    # OCR 行只取代不删除，故基底内容永远可回溯。
+    """
+    CREATE TABLE IF NOT EXISTS human_corrections(
+        id             INTEGER PRIMARY KEY,
+        doi            TEXT NOT NULL,
+        base_record_id INTEGER NOT NULL REFERENCES records(id),
+        base_revision  INTEGER NOT NULL,
+        title          TEXT NOT NULL,
+        abstract       TEXT NOT NULL DEFAULT '',
+        content_hash   TEXT NOT NULL,
+        superseded     INTEGER NOT NULL DEFAULT 0,
+        created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_hc_doi_live "
+    "ON human_corrections(doi) WHERE superseded=0",
+    "CREATE INDEX IF NOT EXISTS idx_hc_doi ON human_corrections(doi)",
+    # 每个有在校人工版的 DOI 一行合并状态；无人工版的 DOI 无此行（供数时沿用 OCR）。
+    # status: clean（可供数）/ conflict（整条暂停供数，保留三方内容）。
+    """
+    CREATE TABLE IF NOT EXISTS correction_states(
+        doi                        TEXT PRIMARY KEY,
+        status                     TEXT NOT NULL,
+        live_record_id             INTEGER NOT NULL REFERENCES records(id),
+        base_record_id             INTEGER NOT NULL REFERENCES records(id),
+        human_correction_id        INTEGER NOT NULL REFERENCES human_corrections(id),
+        merged_title               TEXT,
+        merged_abstract            TEXT,
+        title_source               TEXT NOT NULL DEFAULT '',
+        abstract_source            TEXT NOT NULL DEFAULT '',
+        title_conflict             INTEGER NOT NULL DEFAULT 0,
+        abstract_conflict          INTEGER NOT NULL DEFAULT 0,
+        conflict_detail            TEXT,
+        resolution_ocr_record_id   INTEGER,
+        resolution_human_id        INTEGER,
+        resolution_detail          TEXT,
+        updated_at                 TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS correction_batches(
+        id         INTEGER PRIMARY KEY,
+        kind       TEXT NOT NULL,           -- submit / resolve
+        status     TEXT NOT NULL,           -- committed / rejected
+        total      INTEGER NOT NULL DEFAULT 0,
+        detail     TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """,
 ]
 
 

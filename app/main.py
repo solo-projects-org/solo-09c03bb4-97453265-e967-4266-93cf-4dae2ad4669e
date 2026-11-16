@@ -5,9 +5,9 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import records as records_mod
+from . import corrections, records as records_mod
 from . import rebuild as rebuild_mod
 from . import search as search_mod
 from . import state
@@ -76,6 +76,8 @@ def get_status() -> dict:
         "record_count": record_count,
         "superseded_count": superseded,
         "rebuild_in_progress": state.rebuild_lock.locked(),
+        "correction_counts": corrections.counts(c),
+        "correction_batches": corrections.recent_batches(),
         "dict_versions": dicts,
         "rebuild_jobs": jobs,
         "import_batches": batches,
@@ -139,3 +141,68 @@ def list_records(include_superseded: bool = False,
         (limit,),
     ).fetchall()
     return {"count": len(rows), "results": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# 人工校订：提交（整批事务）、状态查询、冲突裁决、供数 CSV 下载
+# ---------------------------------------------------------------------------
+
+@app.post("/api/corrections")
+async def submit_corrections(payload: dict) -> JSONResponse:
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise HTTPException(400, "items 必须是非空数组，每项含 doi/title/abstract")
+    try:
+        result = corrections.submit_corrections(items)
+    except corrections.CorrectionError as exc:
+        # 拒收留痕在服务层完成，这里仅返回错误，不改动任何校订数据。
+        raise HTTPException(400, str(exc)) from exc
+    return JSONResponse(result, status_code=201)
+
+
+@app.get("/api/corrections")
+def list_corrections(status: str | None = Query(None),
+                     limit: int = Query(100, ge=1, le=500)) -> dict:
+    return corrections.list_states(status, limit)
+
+
+@app.get("/api/corrections/{doi:path}")
+def get_correction(doi: str) -> dict:
+    data = corrections.get_state(doi)
+    if data is None:
+        raise HTTPException(404, f"DOI {doi} 尚无人工校订")
+    return data
+
+
+@app.post("/api/corrections/{doi:path}/resolve")
+def resolve_correction(doi: str, payload: dict) -> dict:
+    resolutions = payload.get("resolutions")
+    try:
+        ocr_id = int(payload.get("expected_ocr_record_id"))
+        human_id = int(payload.get("expected_human_correction_id"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            400, "expected_ocr_record_id / expected_human_correction_id "
+                 "必须为整数（页面版本绑定）"
+        ) from exc
+    try:
+        return corrections.resolve_conflict(doi, resolutions or {},
+                                            ocr_id, human_id)
+    except corrections.CorrectionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except corrections.CorrectionError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/export/supply.csv")
+def export_supply_csv() -> Response:
+    # 单条只读查询生成的同一已提交快照；冲突题录整条排除，未校订沿用最新 OCR。
+    body = corrections.export_csv()
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                'attachment; filename="supply_records.csv"'
+        },
+    )
