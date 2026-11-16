@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCR 题录纠错检索系统</title>
+<style>
+  :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; --blue:#0969da; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin:0; color:#1f2328; background:var(--bg); }
+  header { background:#24292f; color:#fff; padding:14px 24px; }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; font-size:12px; color:#afb8c1; }
+  main { max-width:1080px; margin:20px auto; padding:0 16px; display:grid; gap:16px; }
+  .card { background:#fff; border:1px solid var(--bd); border-radius:8px; padding:16px; }
+  .card h2 { margin:0 0 12px; font-size:15px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  input[type=search], input[type=text] { padding:8px 10px; border:1px solid var(--bd);
+         border-radius:6px; font-size:14px; min-width:260px; flex:1; }
+  button { padding:8px 16px; border:1px solid var(--bd); border-radius:6px;
+           background:#f6f8fa; cursor:pointer; font-size:14px; }
+  button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { border:1px solid var(--bd); padding:6px 8px; text-align:left; vertical-align:top; }
+  th { background:var(--bg); }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; }
+  .pill.active { background:#dafbe1; color:var(--ok); }
+  .pill.building { background:#fff8c5; color:var(--warn); }
+  .pill.failed, .pill.rejected, .pill.abandoned { background:#ffebe9; color:var(--err); }
+  .pill.superseded { background:#eaeef2; color:#57606a; }
+  .pill.accepted, .pill.reused, .pill.done { background:#dafbe1; color:var(--ok); }
+  .msg { margin-top:10px; padding:10px 12px; border-radius:6px; font-size:13px; white-space:pre-wrap; }
+  .msg.ok { background:#dafbe1; border:1px solid #aceebb; }
+  .msg.err { background:#ffebe9; border:1px solid #ffabaf; }
+  .muted { color:#656d76; font-size:12px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:780px){ .grid2 { grid-template-columns:1fr; } }
+  code { background:var(--bg); padding:1px 5px; border-radius:4px; }
+  .hint { font-size:12px; color:#656d76; margin-top:6px; line-height:1.6; }
+  .abstract { color:#57606a; max-width:420px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OCR 题录纠错检索系统</h1>
+  <p>FastAPI · SQLite FTS5 · 替换词典原子换版 · 重建期间旧索引持续服务</p>
+</header>
+<main>
+  <section class="card">
+    <h2>① 检索（查询词与题录使用同一活动词典归一，全部命中才返回）</h2>
+    <div class="row">
+      <input id="q" type="search" placeholder="例如：teh quantum machne（可故意写错词）">
+      <button class="primary" onclick="doSearch()">检索</button>
+      <button onclick="refreshStatus()">刷新状态</button>
+    </div>
+    <div id="searchMeta" class="hint"></div>
+    <div id="searchMsg"></div>
+    <div style="margin-top:10px; overflow-x:auto">
+      <table id="searchTable"><thead>
+        <tr><th>DOI</th><th>原题名</th><th>修订号</th><th>摘要（前 240 字）</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <div class="grid2">
+    <section class="card">
+      <h2>② 上传题录 CSV</h2>
+      <div class="row">
+        <input id="csvFile" type="file" accept=".csv,text/csv">
+        <button class="primary" onclick="uploadCsv()">上传导入</button>
+      </div>
+      <div class="hint">必需列：<code>doi,revision,title</code>，可选 <code>abstract</code>。
+        高修订更正旧文；同版同文复用；同版异文或旧版整批拒收。</div>
+      <div id="csvMsg"></div>
+    </section>
+
+    <section class="card">
+      <h2>③ 上传替换词典 CSV</h2>
+      <div class="row">
+        <input id="dictFile" type="file" accept=".csv,text/csv">
+        <button class="primary" onclick="uploadDict()">上传并重建</button>
+      </div>
+      <div class="hint">表头 <code>wrong,correct</code>；按完整英文词、忽略大小写替换；
+        正词不得再作错词。重建期间沿用旧词典检索，题录导入不中断。</div>
+      <div id="dictMsg"></div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>④ 系统状态</h2>
+    <div id="statusBox" class="hint">加载中…</div>
+    <div style="margin-top:10px; overflow-x:auto">
+      <table id="dictTable"><thead>
+        <tr><th>词典版本</th><th>状态</th><th>条目</th><th>FTS 表</th><th>基线 FTS</th><th>错误</th><th>操作</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+    <div style="margin-top:12px; overflow-x:auto">
+      <table id="batchTable"><thead>
+        <tr><th>批次</th><th>文件</th><th>状态</th><th>总行</th><th>采纳</th><th>复用</th><th>时间</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+function show(el, cls, text){ el.innerHTML = `<div class="msg ${cls}">${escapeHtml(text)}</div>`; }
+function escapeHtml(s){ return String(s ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function pill(s){ return `<span class="pill ${s}">${s}</span>`; }
+
+async function uploadCsv(){
+  const f = $('csvFile').files[0];
+  if(!f){ show($('csvMsg'),'err','请先选择 CSV 文件'); return; }
+  const fd = new FormData(); fd.append('file', f);
+  try{
+    const r = await fetch('/api/records/import',{method:'POST',body:fd});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || r.status);
+    show($('csvMsg'),'ok',
+      `批次 #${d.batch_id} ${d.status}：共 ${d.total} 行，采纳 ${d.accepted}，复用 ${d.reused}`);
+    refreshStatus();
+  }catch(e){ show($('csvMsg'),'err','整批拒收：'+e.message); refreshStatus(); }
+}
+
+async function uploadDict(){
+  const f = $('dictFile').files[0];
+  if(!f){ show($('dictMsg'),'err','请先选择词典 CSV'); return; }
+  const fd = new FormData(); fd.append('file', f);
+  try{
+    const r = await fetch('/api/dictionaries',{method:'POST',body:fd});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || r.status);
+    show($('dictMsg'),'ok',
+      `词典版本 #${d.dict_version_id} 已开始后台重建（${d.entry_count} 条，新表 ${d.fts_table}）。\n` +
+      '重建期间检索仍走旧索引，完成后自动切换。');
+    pollStatus();
+  }catch(e){ show($('dictMsg'),'err',e.message); refreshStatus(); }
+}
+
+async function retryDict(id){
+  try{
+    const r = await fetch(`/api/dictionaries/${id}/retry`,{method:'POST'});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.detail || r.status);
+    show($('dictMsg'),'ok',`版本 #${id} 已重新开始构建，作业 #${d.rebuild_job_id}`);
+    pollStatus();
+  }catch(e){ show($('dictMsg'),'err',e.message); }
+}
+
+async function doSearch(){
+  const q = $('q').value.trim();
+  const tb = $('#searchTable tbody'); tb.innerHTML='';
+  if(!q){ $('searchMeta').textContent='请输入查询词'; return; }
+  const r = await fetch('/api/search?q='+encodeURIComponent(q));
+  const d = await r.json();
+  if(!r.ok){ show($('searchMsg'),'err',d.detail||r.status); return; }
+  $('searchMsg').innerHTML='';
+  $('searchMeta').innerHTML =
+    `归一后查询词：<b>${d.normalized_terms.map(escapeHtml).join(' ')}</b> · ` +
+    `词典版本 #${d.dict_version_id} · 索引 ${d.fts_table} · 命中 ${d.count}`;
+  if(!d.count){ tb.innerHTML='<tr><td colspan="4" class="muted">无命中（要求全部查询词均命中）</td></tr>'; return; }
+  for(const x of d.results){
+    tb.insertAdjacentHTML('beforeend',
+      `<tr><td>${escapeHtml(x.doi)}</td><td>${escapeHtml(x.title)}</td>`+
+      `<td>${x.revision}</td><td class="abstract">${escapeHtml((x.abstract||'').slice(0,240))}</td></tr>`);
+  }
+}
+
+async function refreshStatus(){
+  const r = await fetch('/api/status'); const d = await r.json();
+  $('statusBox').innerHTML =
+    `活动词典版本：<b>#${d.active_dict_version_id}</b>（0=无词典，恒等映射） · `+
+    `活动 FTS：<b>${d.active_fts}</b> · 现行题录：<b>${d.record_count}</b> · `+
+    `已取代：${d.superseded_count} · 重建中：${d.rebuild_in_progress ? '是' : '否'}`+
+    (d.startup_recovery && (d.startup_recovery.abandoned_jobs.length ||
+      d.startup_recovery.orphan_fts.length || d.startup_recovery.active_rebuilt)
+      ? `<br>上次启动恢复：${escapeHtml(JSON.stringify(d.startup_recovery))}` : '');
+  const dt = $('#dictTable tbody'); dt.innerHTML='';
+  for(const v of d.dict_versions){
+    dt.insertAdjacentHTML('beforeend',
+      `<tr><td>#${v.id}</td><td>${pill(v.status)}</td><td>${v.entry_count}</td>`+
+      `<td><code>${v.fts_table}</code></td><td><code>${v.base_fts}</code></td>`+
+      `<td class="abstract">${escapeHtml(v.error||'')}</td>`+
+      `<td>${['failed','building'].includes(v.status)
+        ? `<button onclick="retryDict(${v.id})">重试</button>` : ''}</td></tr>`);
+  }
+  const bt = $('#batchTable tbody'); bt.innerHTML='';
+  for(const b of d.import_batches){
+    bt.insertAdjacentHTML('beforeend',
+      `<tr><td>#${b.id}</td><td>${escapeHtml(b.filename||'')}</td>`+
+      `<td>${pill(b.status)}</td><td>${b.total}</td><td>${b.accepted}</td>`+
+      `<td>${b.reused}</td><td>${b.received_at}</td></tr>`);
+  }
+}
+
+function pollStatus(){
+  refreshStatus();
+  const t = setInterval(async ()=>{
+    const r = await fetch('/api/status'); const d = await r.json();
+    if(!d.rebuild_in_progress){ clearInterval(t); show($('dictMsg'),'ok','重建已结束，可查看状态表结果'); }
+    refreshStatus();
+  }, 1000);
+}
+$('q').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
+refreshStatus();
+</script>
+</body>
+</html>

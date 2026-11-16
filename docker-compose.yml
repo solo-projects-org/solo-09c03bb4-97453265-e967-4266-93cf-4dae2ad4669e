@@ -1,0 +1,15 @@
+services:
+  ocr-lit:
+    build: .
+    image: ocr-lit-fts:latest
+    container_name: ocr-lit-fts
+    ports:
+      - "8000:8000"
+    volumes:
+      - ocr_lit_data:/data
+    environment:
+      DB_PATH: /data/app.db
+    restart: unless-stopped
+
+volumes:
+  ocr_lit_data:
